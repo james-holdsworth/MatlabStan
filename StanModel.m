@@ -14,9 +14,6 @@
 % ATTRIBUTES
 %     file   - string, optional
 %              The string passed is the filename containing the Stan model.
-%     stan_version - [MAJOR MINOR PATCH] w/ Stan version
-%              This is typically set automatically, but can be set
-%              explicitly as a vector [MAJOR MINOR PATCH] if needed
 %     method - string, optional
 %              {'sample' 'optimize' 'variational'}, default = 'sample'
 %     model_code - string, optional
@@ -85,6 +82,7 @@
 %     optimizing
 %     sampling
 %     help
+%     stan_version - returns a vector [MAJOR MINOR PATCH] w/ Stan version
 %     command - displays the Stan commandline parameters for current model
 %     model_binary_path - returns the path to C++ binary for current model
 %     copy - returns a shallow copy of the current model
@@ -97,18 +95,22 @@
 %     https://github.com/brian-lau/MatlabStan
 
 % TODO
+% unique filenames for outputs?
 % expose remaining pystan parameters
 % dump reader (to load data as struct)
 % model definitions
+% compile flags
 % Windows
+% x inits, still need test
+% x fullfile warnings on 2012b
+% o hash to unique names for data/inits
 % o hash for binary doesn't make sense as dependent
+% o unique names for inits & data
 
 classdef StanModel < handle
    properties
       stan_home
-      stan_version
       working_dir
-      id 
    end
    properties(SetAccess = private)
       model_home = ''% url or path to .stan file
@@ -118,6 +120,7 @@ classdef StanModel < handle
       model_name
       model_code
       
+      id 
       iter
       warmup
       thin
@@ -154,7 +157,7 @@ classdef StanModel < handle
       model_name_
    end
    properties(SetAccess = protected)
-      version = '0.9.0';
+      version = '0.7.0';
    end
 
    methods
@@ -163,13 +166,11 @@ classdef StanModel < handle
       function self = StanModel(varargin)
          p = inputParser;
          p.KeepUnmatched = true;
-         p.FunctionName = 'StanModel constructor';
+         p.FunctionName = 'stan constructor';
          p.addParamValue('stan_home',mstan.stan_home);
-         p.addParamValue('stan_version',[],@(x) isnumeric(x) && numel(x)==3);
          p.addParamValue('file','');
          p.addParamValue('model_name','anon_model');
          p.addParamValue('model_code',{});
-         p.addParamValue('id','',@ischar);
          p.addParamValue('working_dir',pwd);
          p.addParamValue('method','sample',@(x) any(strcmp(x,...
             {'sample' 'optimize' 'variational' 'diagnose'})));
@@ -188,20 +189,29 @@ classdef StanModel < handle
                'processManager (https://github.com/brian-lau/MatlabProcessManager) is required');
          end
 
-         if isempty(p.Results.id)
-            self.random_id();
-         else
-            self.id = p.Results.id;
+         % TODO: move this into stan_version
+         count = 0;
+         while 1 % FIXME, occasionally stanc does not return version?
+            try
+               ver = self.stan_version();
+               [self.defaults,self.validators] = mstan.stan_params(ver);
+               break;
+            catch err
+               if count == 0
+                  disp('Having a problem getting stan version.');
+                  disp('This is likely a problem with Java running out of file descriptors');
+               end
+               if count <= 5
+                   disp('Trying again.');
+                   pause(0.25);
+               else
+                   disp('Giving up.');
+                   rethrow(err);
+               end
+               count = count + 1;
+            end
          end
-         
-         if isempty(p.Results.stan_version)
-            self.stan_version = self.get_stan_version();
-         else
-            self.stan_version = p.Results.stan_version;
-         end
-         
-         [self.defaults,self.validators] = mstan.stan_params(self.stan_version);
-         self.params = self.defaults;
+         self.params = self.defaults;         
          
          if isempty(p.Results.file)
             self.file = '';
@@ -216,7 +226,10 @@ classdef StanModel < handle
          self.chains = p.Results.chains;
          
          if isempty(p.Results.sample_file)
-            self.params.output.file = [self.id '-output.csv'];
+            self.sample_file = self.params.output.file;
+         else
+            self.sample_file = p.Results.sample_file;
+            self.params.output.file = self.sample_file;
          end
 
          % pass remaining inputs to set()
@@ -226,16 +239,16 @@ classdef StanModel < handle
 
       function set(self,varargin)
          p = inputParser;
-         p.KeepUnmatched = false;
+         p.KeepUnmatched= false;
          p.FunctionName = 'StanModel parameter setter';
          p.addParamValue('stan_home',self.stan_home);
          p.addParamValue('file',self.file);
          p.addParamValue('model_name',self.model_name);
          p.addParamValue('model_code',self.model_code);
-         p.addParamValue('id',self.id);
          p.addParamValue('working_dir',self.working_dir);
          p.addParamValue('method',self.method);
          p.addParamValue('sample_file',self.sample_file);
+         p.addParamValue('id',self.id);
          p.addParamValue('iter',self.iter);
          p.addParamValue('warmup',self.warmup);
          p.addParamValue('thin',self.thin);
@@ -264,13 +277,16 @@ classdef StanModel < handle
          end
          self.working_dir = p.Results.working_dir;
          
-         if ~isempty(p.Results.id)
-            self.id = p.Results.id;
-         end
-         self.params.output.file = [self.id '-output.csv'];
-        
          self.method = p.Results.method;
          self.chains = p.Results.chains;
+         
+         if isempty(p.Results.sample_file)
+            self.sample_file = self.params.output.file;
+         else
+            self.sample_file = p.Results.sample_file;
+            self.params.output.file = self.sample_file;
+         end
+         self.id = p.Results.id;
          self.iter = p.Results.iter;
          self.warmup = p.Results.warmup;
          self.thin = p.Results.thin;
@@ -287,7 +303,7 @@ classdef StanModel < handle
          [success,fa] = fileattrib(d);
          if ~success
             error('StanModel:stan_home:InputFormat',...
-               'Can''t parse stan_home. Is it set correctly? Check ''mstan.stan_home''');
+               'Can''t parse stan_home. Is it set correctly?');
          end
          if fa.directory
             if exist(fullfile(fa.Name,'makefile'),'file') ...
@@ -448,18 +464,6 @@ classdef StanModel < handle
          end
       end
       
-      function set.method(self,method)
-         assert(ischar(method),'Method must be a string');
-         method = lower(method);
-         assert(any(strcmp(method,{'sample','optimize','variational'})),...
-            'Method must be one of ''sample'', ''optimize'', ''variational''');
-         
-         if any(strcmp(method,{'optimize' 'variational'}))
-            self.chains = 1;
-         end
-         self.method = method;
-      end
-      
       function set.chains(self,n_chains)
          n_processors = java.lang.Runtime.getRuntime.availableProcessors;
          if n_chains < 1
@@ -468,34 +472,7 @@ classdef StanModel < handle
          elseif n_chains > n_processors
             warning('stan:chains:InputFormat','# of chains > # of cores.');
          end
-         
-         if any(strcmp(self.method,{'optimize' 'variational'}))
-            self.chains = 1;
-         else
-            self.chains = round(n_chains);
-         end
-         
-         if self.chains < numel(self.init)
-            self.init = self.init(1:self.chains);
-         elseif self.chains > numel(self.init)
-            % TODO
-            if isempty(self.init)
-               self.init = []; % Default
-            elseif numel(self.init) == 1
-               self.init(2:n_chains) = self.init;
-            elseif isstruct(self.init)
-               temp = num2cell(self.init);
-               if isequal(temp{:})
-                  self.init(numel(self.init):n_chains) = self.init(1);
-               else
-                  self.init = [];
-               end
-            elseif all(self.init == self.init(1))
-               self.init(numel(self.init)+1:n_chains) = self.init(1);
-            else
-               self.init = []; % Default
-            end
-         end
+         self.chains = round(n_chains);
       end
       
       function set.refresh(self,refresh)
@@ -509,19 +486,14 @@ classdef StanModel < handle
       end
       
       function set.id(self,id)
-         if ischar(id) && ~isempty(id)
-            self.id = id;
-            % Update the output filename
-            self.params.output.file = [self.id '-output.csv'];
-         else
-            error('bad id');
-         end
+         validateattributes(id,self.validators.id{1},self.validators.id{2})
+         self.params.id = id;
       end
       
-      function random_id(self)
-         self.id = mstan.randomUUID('base62');
+      function id = get.id(self)
+         id = self.params.id;
       end
-                  
+            
       function set.iter(self,iter)
          validateattributes(iter,self.validators.sample.num_samples{1},...
             self.validators.sample.num_samples{2})
@@ -553,17 +525,12 @@ classdef StanModel < handle
       end
       
       function set.init(self,init)
-         % Set initial conditions for chains
-         % Can have different inits for each chain
          if isstruct(init) || isa(init,'containers.Map')
-            nChains = numel(init);
-            for i = 1:nChains
-               fname = fullfile(self.working_dir,[self.id '-init-' num2str(i) '.R']);
-               mstan.rdump(fname,init(i));
-               fnames{i} = fname;
-            end
-            self.init = init(:)';
-            self.params.init = fnames;
+            % FIXME: how to contruct filename? also for data
+            fname = fullfile(self.working_dir,'temp.init.R');
+            mstan.rdump(fname,init);
+            self.init = init;
+            self.params.init = fname;
          elseif ischar(init)
             if exist(init,'file') %% FIXME: exist checks in entire Matlabpath
                % TODO: read data into struct... what a mess...
@@ -575,23 +542,14 @@ classdef StanModel < handle
             end
          else
             if isempty(init)
-               nChains = self.chains;
-               self.init = repmat(self.defaults.init,1,nChains);
+               self.init = self.defaults.init;
                self.params.init = self.defaults.init;
             else
-               nChains = numel(init);
-               for i = 1:nChains
-                  validateattributes(init(i),self.validators.init{1},...
-                     self.validators.init{2});
-               end
-               self.init = init(:)';
-               self.params.init = init(:)';
+               validateattributes(init,self.validators.init{1},...
+                  self.validators.init{2})
+               self.init = init;
+               self.params.init = init;
             end
-         end
-         
-         if self.chains ~= nChains
-            % TODO, setter getting called repeatedly?
-            self.chains = nChains;
          end
       end
       
@@ -736,7 +694,7 @@ classdef StanModel < handle
       function set.data(self,d)
          if isstruct(d) || isa(d,'containers.Map') || isa(d,'RData')
             % FIXME: how to contruct filename?
-            fname = fullfile(self.working_dir,[self.id '-data.R']);
+            fname = fullfile(self.working_dir,'temp.data.R');
             if isa(d,'RData')
                rdump(d,fname);
             else
@@ -775,31 +733,23 @@ classdef StanModel < handle
             if self.verbose
                fprintf('We have to compile the model first...\n');
             end
-            self.compile('model');
+            self.compile();
          end
          
          if self.verbose
             fprintf('Stan is sampling with %g chains...\n',self.chains);
          end
-         
+         chain_id = 1:self.chains; % TODO chain_id parameter?
          [~,name,ext] = fileparts(self.sample_file);
          base_name = self.sample_file;
+         base_id = self.id;
          for i = 1:self.chains
-            % Set a filename for each chain
-            sample_file{i} = [name '-' num2str(i) ext];
+            sample_file{i} = [name '-' num2str(chain_id(i)) ext];
             self.sample_file = sample_file{i};
-            
-            % Give Stan a different id for each chain. This is used to advance 
-            % Stan's RNG to ensure that draws come from non-overlapping sequences.
-            self.params.id = i;
-            
-            % Chain specific inits
-            if isstruct(self.init) || isa(self.init,'containers.Map')
-               self.params.init = fullfile(self.working_dir,[self.id '-init-' num2str(i) '.R']);
-            else
-               self.params.init = self.init(i);
-            end
-            
+            % Stan automatically uses the id to advance its RNG. Note that
+            % Stan id defaults to 0, although you cannot actually pass this
+            % in as a valid value.
+            self.id = base_id + chain_id(i) - 1;
             p(i) = processManager('id',sample_file{i},...
                                'command',sprintf('%s',self.command{:}),...
                                'workingDir',self.working_dir,...
@@ -809,10 +759,8 @@ classdef StanModel < handle
                                'printStdout',self.verbose,...
                                'autoStart',false);
          end
-         
-         % Reset base name
          self.sample_file = base_name;
-         self.params.init = self.init;
+         self.id = base_id;
          
          fit = StanFit('model',copy(self),'processes',p,...
                        'output_file',cellfun(@(x) fullfile(self.working_dir,x),sample_file,'uni',0),...
@@ -831,7 +779,7 @@ classdef StanModel < handle
             if self.verbose
                fprintf('We have to compile the model first...\n');
             end
-            self.compile('model');
+            self.compile();
          end
          
          if self.verbose
@@ -864,7 +812,7 @@ classdef StanModel < handle
             if self.verbose
                fprintf('We have to compile the model first...\n');
             end
-            self.compile('model');
+            self.compile();
          end
          
          if self.verbose
@@ -889,37 +837,8 @@ classdef StanModel < handle
       function diagnose(self)
          error('not done');
       end
-
-      function ver = get_stan_version(self)
-         % Get Stan version by calling stanc
-         count = 0;
-         while 1 % Occasionally stanc does not return version?
-            try
-               ver = self.get_stan_version_();
-               if count > 0
-                  disp('Succeeded in getting stan version.');
-               end
-               break;
-            catch err
-               if count == 0
-                  disp('Having a problem getting stan version.');
-                  disp('This is likely a problem with Java running out of file descriptors');
-               end
-               if count <= 5
-                   disp('Trying again.');
-                   pause(0.25);
-               else
-                   disp('Giving up.');
-                   disp('You can try setting the Stan version explicitly using the stan_version attribute.');
-                   disp('i.e. StanModel.stan_version = [2 15 0]');
-                   rethrow(err);
-               end
-               count = count + 1;
-            end
-         end        
-      end
       
-      function ver = get_stan_version_(self)
+      function ver = stan_version(self)
          command = [fullfile(self.stan_home,'bin','stanc') ' --version'];
          p = processManager('id','stanc version','command',command,...
                             'keepStdout',true,...
@@ -928,7 +847,10 @@ classdef StanModel < handle
          p.block(0.05);
          if p.exitValue == 0
             str = regexp(p.stdout{1},'\ ','split');
-            ver = cellfun(@str2num,regexp(str{3},'\.','split'));
+            if str{2}(1) == 'v' 
+                str{2} = str{2}(2:end);
+            end
+            ver = cellfun(@str2num,regexp(str{2},'\.','split'));
          else
             fprintf('%s\n',p.stdout{:});
          end
@@ -955,49 +877,23 @@ classdef StanModel < handle
          end
       end
       
-      function config(self)
-         % Get CmdStan configuration
-         p = processManager('id','stan help','command','make help-dev',...
-                            'workingDir',self.stan_home,...
-                            'wrap',100,...
-                            'keepStdout',true,...
-                            'printStdout',false);
-         p.block(0.05);
-         fprintf('%s\n',p.stdout{:});
-      end
-      
-      function compile(self,target,flags)
-         % Compile CmdStan components and models
-         if nargin < 3
-            flags = '';
-         elseif iscell(flags) && all(cellfun(@(x) ischar(x),flags))
-            flags = sprintf('%s ',flags{:});
-         elseif ischar(flags)
-            flags = sprintf('%s ',flags);
-         else
-            error('StanModel:compile:InputFormat',...
-               'flags should be formatted as a string or cell array of strings');
-         end
-         
+      function compile(self,target)
          if nargin < 2
             target = 'model';
          end
-         
-         switch lower(target)
-            case {'stanc' 'libstan.a' 'libstanc.a' 'print' 'stansummary'}
-               % FIXME: does Stan on windows use / or \?
-               command = ['make ' flags 'bin/' target];
-               printStderr = false;
-            case 'model'
-               if ispc
-                  command = ['make ' flags regexprep(self.model_binary_path,'\','/')];
-               else
-                  command = ['make ' flags self.model_binary_path];
-               end
-               printStderr = and(true,self.verbose);
-            otherwise
-               error('StanModel:compile:InputFormat',...
-                  'Unknown target');
+         if any(strcmp({'stanc' 'libstan.a' 'libstanc.a' 'print'},target))
+            % FIXME: does Stan on windows use / or \?
+            command = ['make bin/' target];
+            printStderr = false;
+         elseif strcmp(target,'model')
+            if ispc
+               command = ['make ' regexprep(self.model_binary_path,'\','/')];
+            else
+               command = ['make ' self.model_binary_path];
+            end
+            printStderr = and(true,self.verbose);
+         else
+            error('Unknown target');
          end
 
          p = processManager('id','compile',...
@@ -1028,7 +924,7 @@ classdef StanModel < handle
          warning off MATLAB:structOnObject
          S = struct(self);
          warning on MATLAB:structOnObject
-         for i = 1:length(props)
+         for i=1:length(props)
             % Do not copy Transient or Dependent Properties
             if meta.Properties{i}.Transient || meta.Properties{i}.Dependent
                continue;
